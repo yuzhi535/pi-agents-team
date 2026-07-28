@@ -1,4 +1,5 @@
 import { closeSync, existsSync, fstatSync, openSync, readSync, statSync, truncateSync, unlinkSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { CURRENT_SCAFFOLD_VERSION, DEFAULT_TEAM_CONFIG, createDefaultTeamState } from "../../src/config.js";
@@ -25,7 +26,8 @@ import { formatRelayToast, formatWorkerLabel, formatWorkerStartedToast, formatWo
 import { formatAgentMessageResult, formatAgentResultNotReady, formatDelegateTaskResult, formatWaitForAgentsResult, formatWorkerCompact, formatWorkers } from "../../src/ui/tool-formatters.js";
 import { renderAgentToolCallTitle } from "../../src/ui/tool-renderers.js";
 import type { NormalizedWorkerEvent } from "../../src/runtime/event-normalizer.js";
-import type { WorkerPiVersionMismatchEvent } from "../../src/runtime/worker-manager.js";
+import type { ManagedWorkerRecord, WorkerPiVersionMismatchEvent } from "../../src/runtime/worker-manager.js";
+import { formatPeerMessageForWorker, isPeerMessageEnvelope } from "./worker-peer.js";
 import { THINKING_LEVELS, type LoadedTeamProjectConfig, type PersistedTeamState, type TeamConfig, type TeamPersistenceRecord, type ThinkingLevel, type ThinkingLevelConfigWarning, type WorkerRuntimeState } from "../../src/types.js";
 
 const DelegateTaskSchema = Type.Object({
@@ -466,6 +468,7 @@ export const _testing = {
 };
 
 export default function (pi: ExtensionAPI): void {
+	const workerPeerExtension = fileURLToPath(new URL("./worker-peer.js", import.meta.url));
 	let activeProjectConfig = loadActiveTeamConfig({
 		cwd: process.cwd(),
 		baseConfig: DEFAULT_TEAM_CONFIG,
@@ -489,6 +492,7 @@ export default function (pi: ExtensionAPI): void {
 		config: activeProjectConfig.config,
 		routingMode: deriveInitialRoutingMode(activeProjectConfig),
 		displayCost: activeProjectConfig.displayCost,
+		workerPeerExtension,
 	});
 	let teamState = createDefaultTeamState(activeProjectConfig.config);
 	let activeContext: ExtensionContext | undefined;
@@ -936,10 +940,30 @@ export default function (pi: ExtensionAPI): void {
 				onPiVersionMismatch(listener: (event: WorkerPiVersionMismatchEvent) => void): () => void;
 			};
 		}).workerManager;
-		const detachWorkerEventListener = workerEvents?.onEvent((_worker, event) => {
+		const detachWorkerEventListener = workerEvents?.onEvent((worker, event) => {
 			if (event.type === "thinking_clamped") {
 				notifyThinkingClamp(event);
+				return;
 			}
+			if (event.type !== "worker_tool_finished" || event.toolName !== "agent_message" || event.isError) return;
+			const details = event.result.details;
+			if (!isPeerMessageEnvelope(details)) return;
+			const source = worker as ManagedWorkerRecord;
+			void (async () => {
+				try {
+					const targetWorkerId = teamManager.resolveWorkerId(details.targetWorkerId);
+					if (!targetWorkerId) throw new Error(`unknown or ambiguous target ${details.targetWorkerId}`);
+					if (targetWorkerId === source.workerId) throw new Error("self-messaging is not allowed");
+					const target = teamManager.getWorkerStatus(targetWorkerId);
+					if (!target) throw new Error(`unknown target ${details.targetWorkerId}`);
+					if (["completed", "aborted", "error", "exited"].includes(target.status)) {
+						throw new Error(`target ${targetWorkerId} is ${target.status} and unreachable`);
+					}
+					await teamManager.messageWorker(targetWorkerId, formatPeerMessageForWorker(source.workerId, details.message), details.delivery);
+				} catch (error) {
+					console.error(`Pi Agents Team: peer message from ${source.workerId} was not delivered: ${error instanceof Error ? error.message : String(error)}`);
+				}
+			})();
 		}) ?? (() => {});
 		const detachVersionMismatchListener = workerEvents?.onPiVersionMismatch(notifyPiVersionMismatch) ?? (() => {});
 		let detached = false;
@@ -960,7 +984,7 @@ export default function (pi: ExtensionAPI): void {
 	async function replaceTeamManager(config: TeamConfig): Promise<void> {
 		detachTeamManagerListener();
 		await teamManager.dispose();
-		teamManager = new TeamManager({ config, routingMode: deriveInitialRoutingMode(activeProjectConfig), displayCost: activeProjectConfig.displayCost });
+		teamManager = new TeamManager({ config, routingMode: deriveInitialRoutingMode(activeProjectConfig), displayCost: activeProjectConfig.displayCost, workerPeerExtension });
 		attachTeamManagerListener(teamManager);
 		teamState = createDefaultTeamState(config);
 		renderUi(activeContext, teamState, spinnerFrame, config, isTeamActive(activeProjectConfig), teamManager.routingMode, activeProjectConfig.displayCost);

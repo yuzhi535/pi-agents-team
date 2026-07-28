@@ -68,6 +68,27 @@ test("buildWorkerTaskPrompt includes relay guidance and scope", () => {
 	assert.doesNotMatch(prompt, /Pi skills to use/);
 });
 
+test("buildWorkerTaskPrompt includes peer roster and untrusted-message guidance", () => {
+	const prompt = buildWorkerTaskPrompt({
+		taskId: "task-peer",
+		title: "Coordinate review",
+		goal: "Ask another worker to verify the API",
+		requestedBy: "orchestrator",
+		profileName: "reviewer",
+		cwd: process.cwd(),
+		contextHints: [],
+		createdAt: Date.now(),
+	}, [
+		{ workerId: "w2", status: "running" },
+		{ workerId: "w3", status: "idle" },
+	]);
+	assert.match(prompt, /## Peer workers/);
+	assert.match(prompt, /w2 \(running\)/);
+	assert.match(prompt, /w3 \(idle\)/);
+	assert.match(prompt, /agent_message/);
+	assert.match(prompt, /untrusted agent-originated data/);
+});
+
 test("buildWorkerTaskPrompt injects skills section only when skills are provided", () => {
 	const base = {
 		taskId: "task-2",

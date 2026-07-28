@@ -81,6 +81,7 @@ const REUSABLE_STATUSES: ReadonlySet<WorkerStatus> = new Set<WorkerStatus>(["idl
 const REUSE_CONTEXT_HARD_PERCENT = 80;
 const REUSE_CONTEXT_MIN_REMAINING_TOKENS = 32768;
 const ACTIVE_PING_REFRESH_TIMEOUT_MS = 2_000;
+const PEER_ROSTER_STATUSES: ReadonlySet<WorkerStatus> = new Set(["starting", "running", "idle", "waiting_followup"]);
 
 function toolsetEqual(a: string[] | undefined, b: string[] | undefined): boolean {
 	if (a === b) return true;
@@ -150,6 +151,7 @@ export class TeamManager {
 	private _routingMode: RoutingMode;
 	private readonly activePingTimeoutMs: number;
 	private readonly activeRefreshes = new Map<string, Promise<ActiveRefreshOutcome>>();
+	private readonly workerPeerExtension?: string;
 	readonly displayCost: boolean;
 
 	constructor(options?: {
@@ -159,8 +161,10 @@ export class TeamManager {
 		routingMode?: RoutingMode;
 		displayCost?: boolean;
 		activePingTimeoutMs?: number;
+		workerPeerExtension?: string;
 	}) {
 		this.config = options?.config ?? DEFAULT_TEAM_CONFIG;
+		this.workerPeerExtension = options?.workerPeerExtension;
 		this.registry = options?.registry ?? new TaskRegistry();
 		this.workerManager = options?.workerManager ?? new WorkerManager();
 		this._routingMode = options?.routingMode ?? "team";
@@ -182,6 +186,12 @@ export class TeamManager {
 		this.events.emit("state_change", this.snapshot());
 	}
 
+	private workerExtensionsForLaunch(launchPlan: { extensionMode: WorkerExtensionMode; workerExtensions?: string[] }): string[] | undefined {
+		if (!this.workerPeerExtension || launchPlan.extensionMode !== "worker-minimal") return launchPlan.workerExtensions;
+		if (launchPlan.workerExtensions?.includes(this.workerPeerExtension)) return launchPlan.workerExtensions;
+		return [...(launchPlan.workerExtensions ?? []), this.workerPeerExtension];
+	}
+
 	private nextWorkerId(): string {
 		do {
 			this.workerCounter += 1;
@@ -194,6 +204,13 @@ export class TeamManager {
 	private nextTaskId(): string {
 		this.taskCounter += 1;
 		return `t${this.taskCounter}`;
+	}
+
+	private buildWorkerPrompt(task: DelegatedTaskInput, sourceWorkerId: string): string {
+		const peers = this.registry.listWorkers()
+			.filter((worker) => worker.workerId !== sourceWorkerId && PEER_ROSTER_STATUSES.has(worker.status))
+			.map((worker) => ({ workerId: worker.workerId, status: worker.status }));
+		return buildWorkerTaskPrompt(task, peers);
 	}
 
 	resolveWorkerId(input: string): string | undefined {
@@ -301,7 +318,7 @@ export class TeamManager {
 				model: launchPlan.model,
 				thinkingLevel: launchPlan.thinkingLevel,
 				tools: launchPlan.tools,
-				workerExtensions: launchPlan.workerExtensions,
+				workerExtensions: this.workerExtensionsForLaunch(launchPlan),
 				systemPromptPath: launchPlan.systemPromptPath,
 				extensionMode: launchPlan.extensionMode,
 				projectTrust,
@@ -339,7 +356,7 @@ export class TeamManager {
 			this.events.emit("state_change", this.snapshot());
 			throw error;
 		}
-		await this.workerManager.promptWorker(workerId, buildWorkerTaskPrompt(task));
+		await this.workerManager.promptWorker(workerId, this.buildWorkerPrompt(task, workerId));
 		const liveWorker = this.workerManager.getWorker(workerId);
 		if (liveWorker) {
 			this.registry.upsertWorker(liveWorker.state);
@@ -603,6 +620,7 @@ export class TeamManager {
 		);
 
 		const projectTrust = resolveWorkerProjectTrustOverride(request, launchPlan.cwd);
+		const workerExtensions = this.workerExtensionsForLaunch(launchPlan);
 		const skills = request.skills?.map((name) => name.trim()).filter((name) => name.length > 0);
 		const newAllowSkills = skills !== undefined && skills.length > 0;
 		const existing = this.workerManager.getLaunchSnapshot(resolvedId);
@@ -619,7 +637,7 @@ export class TeamManager {
 		if (existing.thinkingLevel !== launchPlan.thinkingLevel) mismatches.push(`thinkingLevel`);
 		if (existing.systemPromptPath !== launchPlan.systemPromptPath) mismatches.push(`systemPromptPath`);
 		if (existing.extensionMode !== launchPlan.extensionMode) mismatches.push(`extensionMode`);
-		if (!orderedArrayEqual(existing.workerExtensions, launchPlan.workerExtensions)) mismatches.push(`workerExtensions`);
+		if (!orderedArrayEqual(existing.workerExtensions, workerExtensions)) mismatches.push(`workerExtensions`);
 		if (existing.projectTrust !== projectTrust) {
 			mismatches.push(`projectTrust (${existing.projectTrust ?? "none"} → ${projectTrust ?? "none"})`);
 		}
@@ -678,7 +696,7 @@ export class TeamManager {
 			this.events.emit("state_change", this.snapshot());
 			throw error;
 		}
-		await this.workerManager.promptWorker(resolvedId, buildWorkerTaskPrompt(task));
+		await this.workerManager.promptWorker(resolvedId, this.buildWorkerPrompt(task, resolvedId));
 		const liveWorker = this.workerManager.getWorker(resolvedId);
 		if (liveWorker) {
 			this.registry.upsertWorker(liveWorker.state);
