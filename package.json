@@ -55,7 +55,6 @@
     "check": "npm run typecheck && npm test",
     "build": "node scripts/build-publish.mjs",
     "build:publish": "node scripts/build-publish.mjs",
-    "prepare": "npm run build:publish",
     "prepack": "npm run build:publish",
     "prepublishOnly": "npm run check",
     "smoke:runtime": "tsx scripts/smoke/runtime-worker.ts",
